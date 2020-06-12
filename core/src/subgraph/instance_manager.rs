@@ -637,6 +637,7 @@ where
         );
     }
 
+    // TODO: Use the fullblock here if it's available and there's a trigger that requires it?
     // Obtain current and new block pointer (after this block is processed)
     let light_block = Arc::new(block.light_block());
     let block_ptr_after = EthereumBlockPointer::from(&block);
