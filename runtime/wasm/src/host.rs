@@ -189,7 +189,7 @@ impl RuntimeHost {
         three_box_adapter: Arc<dyn ThreeBoxAdapter>,
     ) -> Result<Self, Error> {
         let api_version = Version::parse(&config.mapping.api_version)?;
-        if !VersionReq::parse("<= 0.0.4").unwrap().matches(&api_version) {
+        if !VersionReq::parse("<= 0.0.5").unwrap().matches(&api_version) {
             return Err(format_err!(
                 "This Graph Node only supports mapping API versions <= 0.0.4, but subgraph `{}` uses `{}`",
                 config.subgraph_id,
@@ -576,7 +576,7 @@ impl RuntimeHostTrait for RuntimeHost {
         proof_of_indexing: SharedProofOfIndexing,
     ) -> Result<BlockState, anyhow::Error> {
         let block_handler = self.handler_for_block(trigger_type)?;
-        let theblock: EthereumBlockType = match dbg!(trigger_type) {
+        let mapping_block: EthereumBlockType = match trigger_type {
             EthereumBlockTriggerType::Every(BlockType::Full) => match graph::block_on_allow_panic(
                 future::lazy(move || {
                     self.host_exports
@@ -585,7 +585,7 @@ impl RuntimeHostTrait for RuntimeHost {
                 })
                 .compat(),
             ) {
-                Ok(block) => Ok(EthereumBlockType::Full(dbg!(block))),
+                Ok(block) => Ok(EthereumBlockType::Full(block)),
                 Err(e) => Err(anyhow::anyhow!(
                     "Failed to load full block: {}, error: {}",
                     &block.number.unwrap().to_string(),
@@ -606,7 +606,7 @@ impl RuntimeHostTrait for RuntimeHost {
             MappingTrigger::Block {
                 handler: block_handler.clone(),
             },
-            &Arc::new(dbg!(theblock)),
+            &Arc::new(mapping_block),
             proof_of_indexing,
         )
         .await
