@@ -147,6 +147,7 @@ pub mod prelude {
         ComponentLoggerConfig, ElasticComponentLoggerConfig, LoggerFactory,
     };
     pub use crate::log::split::split_logger;
+    pub use crate::util::cache_weight::CacheWeight;
     pub use crate::util::error::CompatErr;
     pub use crate::util::futures::{retry, TimeoutError};
 }

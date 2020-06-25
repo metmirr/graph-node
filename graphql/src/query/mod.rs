@@ -1,7 +1,10 @@
 use graph::prelude::{info, o, EthereumBlockPointer, Logger, QueryExecutionError};
 use graphql_parser::query as q;
 use std::collections::BTreeMap;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -59,6 +62,7 @@ where
         deadline: options.deadline,
         max_first: options.max_first,
         cached: AtomicBool::new(true),
+        cache_insert: AtomicBool::new(false),
     };
 
     if !query.is_query() {
@@ -84,7 +88,8 @@ where
             "query" => &query.query_text,
             "variables" => &query.variables_text,
             "query_time_ms" => start.elapsed().as_millis(),
-            "cached" => ctx.cached.load(std::sync::atomic::Ordering::SeqCst),
+            "cached" => ctx.cached.load(Ordering::SeqCst),
+            "cache_insert" => ctx.cache_insert.load(Ordering::SeqCst),
             "block" => block_ptr.map(|b| b.number).unwrap_or(0),
             "complexity" => &query.complexity
         );
