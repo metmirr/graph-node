@@ -118,6 +118,18 @@ async fn main() {
                 .help("Location of the Postgres database used for storing entities"),
         )
         .arg(
+            Arg::with_name("postgres-secondary-hosts")
+                .multiple(true)
+                .use_delimiter(true)
+                .long("postgres-secondary-hosts")
+                .value_name("URL,")
+                .env("GRAPH_PG_SECONDARY_HOSTS")
+                .help(
+                    "Comma-separated urls for read-only Postgres replicas, \
+                       which will share the load with the primary server.",
+                ),
+        )
+        .arg(
             Arg::with_name("ethereum-rpc")
                 .takes_value(true)
                 .multiple(true)
@@ -383,6 +395,8 @@ async fn main() {
         matches.value_of("3box-api").unwrap().to_string(),
     ));
 
+    let pg_read_replicas = matches.values_of("postgres-secondary-hosts");
+
     info!(logger, "Starting up");
 
     // Parse the IPFS URL from the `--ipfs` command line argument
@@ -523,8 +537,21 @@ async fn main() {
         postgres_url.clone(),
         store_conn_pool_size,
         &logger,
-        connection_pool_registry,
+        connection_pool_registry.cheap_clone(),
     );
+
+    let read_only_conn_pools: Vec<_> = pg_read_replicas
+        .into_iter()
+        .flatten()
+        .map(|url| {
+            create_connection_pool(
+                url.to_string(),
+                store_conn_pool_size,
+                &logger,
+                connection_pool_registry.cheap_clone(),
+            )
+        })
+        .collect();
 
     let chain_head_update_listener = Arc::new(PostgresChainHeadUpdateListener::new(
         &logger,
@@ -576,6 +603,7 @@ async fn main() {
                     chain_head_update_listener.clone(),
                     subscriptions.clone(),
                     postgres_conn_pool.clone(),
+                    read_only_conn_pools.clone(),
                     stores_metrics_registry.clone(),
                 )),
             )

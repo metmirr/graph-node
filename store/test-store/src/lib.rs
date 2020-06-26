@@ -75,6 +75,7 @@ lazy_static! {
                     chain_head_update_listener,
                     subscriptions,
                     postgres_conn_pool,
+                    Vec::new(),
                     registry.clone(),
                 ))
             })

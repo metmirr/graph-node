@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::{TryFrom, TryInto};
 use std::iter::FromIterator;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicUsize, Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
@@ -138,6 +138,13 @@ pub struct StoreConfig {
     pub network_name: String,
 }
 
+/// `Write` may read and write, `Read` is read-only.
+#[derive(Copy, Clone, Debug)]
+enum ConnMode {
+    Write,
+    Read,
+}
+
 /// Commonly needed information about a subgraph that we cache in
 /// `Store.subgraph_cache`. Only immutable subgraph data can be cached this
 /// way as the cache lives for the lifetime of the `Store` object
@@ -162,6 +169,8 @@ pub struct StoreInner {
     network_name: String,
     genesis_block_ptr: EthereumBlockPointer,
     conn: Pool<ConnectionManager<PgConnection>>,
+    read_only_pools: Vec<Pool<ConnectionManager<PgConnection>>>,
+    conn_round_robin_counter: AtomicUsize,
 
     /// A cache of commonly needed data about a subgraph.
     subgraph_cache: Mutex<LruCache<SubgraphDeploymentId, SubgraphInfo>>,
@@ -195,6 +204,7 @@ impl Store {
         chain_head_update_listener: Arc<ChainHeadUpdateListener>,
         subscriptions: Arc<SubscriptionManager>,
         pool: Pool<ConnectionManager<PgConnection>>,
+        read_only_pools: Vec<Pool<ConnectionManager<PgConnection>>>,
         registry: Arc<dyn MetricsRegistry>,
     ) -> Self {
         // Create a store-specific logger
@@ -211,6 +221,8 @@ impl Store {
             network_name: config.network_name.clone(),
             genesis_block_ptr: (net_identifiers.genesis_block_hash, 0 as u64).into(),
             conn: pool,
+            read_only_pools,
+            conn_round_robin_counter: AtomicUsize::new(0),
             subgraph_cache: Mutex::new(LruCache::with_capacity(100)),
             storage_cache: e::make_storage_cache(),
             registry,
@@ -740,12 +752,36 @@ impl Store {
         self.conn.get().map_err(Error::from)
     }
 
+    /// Gets a connection to any pool, which may be the main one or one of the read-only pools,
+    /// choosing by round-robin. Use for read-only functionality so load is better distributed in
+    /// the presence of replicas.
+    fn get_read_conn(&self) -> Result<PooledConnection<ConnectionManager<PgConnection>>, Error> {
+        use std::sync::atomic::Ordering;
+
+        // Pick an index by round-robin. Index 0 is the main pool.
+        let pools_count = 1 + self.read_only_pools.len();
+        let round_robin = self.conn_round_robin_counter.fetch_add(1, Ordering::SeqCst);
+        match round_robin % pools_count {
+            0 => &self.conn,
+            n => &self.read_only_pools[n - 1],
+        }
+        .get()
+        .map_err(Error::from)
+    }
+
     // Duplicated logic - this function may eventually go away.
     // See also 220c1ae9-3e8a-42d3-bcc5-b1244a69b8a9
     /// Deprecated. Use `with_entity_conn` instead
-    fn get_entity_conn(&self, subgraph: &SubgraphDeploymentId) -> Result<e::Connection, Error> {
+    fn get_entity_conn(
+        &self,
+        subgraph: &SubgraphDeploymentId,
+        mode: ConnMode,
+    ) -> Result<e::Connection, Error> {
         let start = Instant::now();
-        let conn = self.get_conn()?;
+        let conn = match mode {
+            ConnMode::Write => self.get_conn()?,
+            ConnMode::Read => self.get_read_conn()?,
+        };
         self.registry
             .global_counter(
                 format!("{}_get_entity_conn_secs", subgraph),
@@ -869,7 +905,7 @@ impl StoreTrait for Store {
         Self::block_ptr_with_conn(
             &subgraph_id,
             &self
-                .get_entity_conn(&*SUBGRAPHS_ID)
+                .get_entity_conn(&*SUBGRAPHS_ID, ConnMode::Read)
                 .map_err(|e| QueryExecutionError::StoreError(e.into()))?,
         )
     }
@@ -1000,7 +1036,7 @@ impl StoreTrait for Store {
 
     fn get(&self, key: EntityKey) -> Result<Option<Entity>, QueryExecutionError> {
         let conn = self
-            .get_entity_conn(&key.subgraph_id)
+            .get_entity_conn(&key.subgraph_id, ConnMode::Read)
             .map_err(|e| QueryExecutionError::StoreError(e.into()))?;
         self.get_entity(&conn, &key.subgraph_id, &key.entity_type, &key.entity_id)
     }
@@ -1014,14 +1050,14 @@ impl StoreTrait for Store {
             return Ok(BTreeMap::new());
         }
         let conn = self
-            .get_entity_conn(subgraph_id)
+            .get_entity_conn(subgraph_id, ConnMode::Read)
             .map_err(|e| QueryExecutionError::StoreError(e.into()))?;
         conn.find_many(ids_for_type, BLOCK_NUMBER_MAX)
     }
 
     fn find(&self, query: EntityQuery) -> Result<Vec<Entity>, QueryExecutionError> {
         let conn = self
-            .get_entity_conn(&query.subgraph_id)
+            .get_entity_conn(&query.subgraph_id, ConnMode::Read)
             .map_err(|e| QueryExecutionError::StoreError(e.into()))?;
         self.execute_query(&conn, query)
     }
@@ -1031,7 +1067,7 @@ impl StoreTrait for Store {
         query: EntityQuery,
     ) -> Result<Vec<BTreeMap<String, graphql_parser::query::Value>>, QueryExecutionError> {
         let conn = self
-            .get_entity_conn(&query.subgraph_id)
+            .get_entity_conn(&query.subgraph_id, ConnMode::Read)
             .map_err(|e| QueryExecutionError::StoreError(e.into()))?;
         self.execute_query(&conn, query)
     }
@@ -1040,7 +1076,7 @@ impl StoreTrait for Store {
         query.range = EntityRange::first(1);
 
         let conn = self
-            .get_entity_conn(&query.subgraph_id)
+            .get_entity_conn(&query.subgraph_id, ConnMode::Read)
             .map_err(|e| QueryExecutionError::StoreError(e.into()))?;
 
         let mut results = self.execute_query(&conn, query)?;
@@ -1091,7 +1127,7 @@ impl StoreTrait for Store {
             );
         }
 
-        let econn = self.get_entity_conn(&subgraph_id)?;
+        let econn = self.get_entity_conn(&subgraph_id, ConnMode::Write)?;
 
         let (event, metadata_event, should_migrate) =
             econn.transaction(|| -> Result<_, StoreError> {
@@ -1143,7 +1179,7 @@ impl StoreTrait for Store {
         &self,
         operations: Vec<MetadataOperation>,
     ) -> Result<(), StoreError> {
-        let econn = self.get_entity_conn(&*SUBGRAPHS_ID)?;
+        let econn = self.get_entity_conn(&*SUBGRAPHS_ID, ConnMode::Write)?;
         let event =
             econn.transaction(|| self.apply_metadata_operations_with_conn(&econn, operations))?;
 
@@ -1156,7 +1192,7 @@ impl StoreTrait for Store {
         subgraph: &SubgraphDeploymentId,
         indexes: Vec<AttributeIndexDefinition>,
     ) -> Result<(), SubgraphAssignmentProviderError> {
-        let econn = self.get_entity_conn(subgraph)?;
+        let econn = self.get_entity_conn(subgraph, ConnMode::Write)?;
         econn.transaction(|| self.build_entity_attribute_indexes_with_conn(&econn, indexes))
     }
 
@@ -1186,7 +1222,7 @@ impl StoreTrait for Store {
             }
         }
 
-        let econn = self.get_entity_conn(&subgraph_id)?;
+        let econn = self.get_entity_conn(&subgraph_id, ConnMode::Write)?;
         let (event, metadata_event) = econn.transaction(|| -> Result<_, StoreError> {
             assert_eq!(
                 Some(block_ptr_from),
@@ -1219,7 +1255,7 @@ impl StoreTrait for Store {
         schema: &Schema,
         ops: Vec<MetadataOperation>,
     ) -> Result<(), StoreError> {
-        let econn = self.get_entity_conn(&*SUBGRAPHS_ID)?;
+        let econn = self.get_entity_conn(&*SUBGRAPHS_ID, ConnMode::Write)?;
         econn.transaction(|| -> Result<(), StoreError> {
             let event = self.apply_metadata_operations_with_conn(&econn, ops.clone())?;
             econn.create_schema(schema)?;
@@ -1233,7 +1269,7 @@ impl StoreTrait for Store {
         subgraph_id: &SubgraphDeploymentId,
         ops: Vec<MetadataOperation>,
     ) -> Result<(), StoreError> {
-        let econn = self.get_entity_conn(subgraph_id)?;
+        let econn = self.get_entity_conn(subgraph_id, ConnMode::Write)?;
 
         if !econn.uses_relational_schema() {
             warn!(
@@ -1257,7 +1293,7 @@ impl StoreTrait for Store {
         subgraph_id: &SubgraphDeploymentId,
         block_ptr: &EthereumBlockPointer,
     ) {
-        let econn = match self.get_entity_conn(subgraph_id) {
+        let econn = match self.get_entity_conn(subgraph_id, ConnMode::Write) {
             Ok(econn) => econn,
             Err(e) => {
                 warn!(logger, "failed to get connection to start migrating";
@@ -1326,7 +1362,7 @@ impl SubgraphDeploymentStore for Store {
     }
 
     fn uses_relational_schema(&self, subgraph: &SubgraphDeploymentId) -> Result<bool, Error> {
-        self.get_entity_conn(subgraph)
+        self.get_entity_conn(subgraph, ConnMode::Read)
             .map(|econn| econn.uses_relational_schema())
     }
 
